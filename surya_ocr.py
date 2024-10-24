@@ -2,6 +2,9 @@ import io
 from typing import List, Tuple, Optional
 import logging
 from pathlib import Path
+import zipfile
+import tempfile
+import os
 
 import pypdfium2
 import streamlit as st

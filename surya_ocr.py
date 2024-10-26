@@ -1,3 +1,4 @@
+from datetime import datetime
 import io
 from typing import List, Tuple, Optional
 import logging
@@ -5,7 +6,7 @@ from pathlib import Path
 import zipfile
 import tempfile
 import os
-
+import re
 import pypdfium2
 import streamlit as st
 from pypdfium2 import PdfiumError
@@ -131,6 +132,82 @@ def load_models():
         logger.error(f"Failed to load models: {str(e)}")
         raise SuryaProcessingError(f"Failed to load required models: {str(e)}")
 
+def extract_structured_text(ocr_result) -> dict:
+    """
+    Extract structured information from OCR results with improved pattern matching.
+    Returns a dictionary with DateofBirth, Name, and Description fields.
+    """
+    if not ocr_result or not hasattr(ocr_result, 'text_lines'):
+        return {
+            "DateofBirth": None,
+            "Name": None,
+            "Description": None
+        }
+
+    # Join all text lines with proper spacing
+    all_text = ' '.join([line.text.strip() for line in ocr_result.text_lines if line.text])
+    
+    # Initialize result dictionary
+    result = {
+        "DateofBirth": None,
+        "Name": None,
+        "Description": None
+    }
+    
+    # Enhanced date patterns
+    date_patterns = [
+        r'\b(?:DOB|Date\s+of\s+Birth|Birth\s+Date)[\s:]+([0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{2,4})\b',
+        r'\b(?:DOB|Date\s+of\s+Birth|Birth\s+Date)[\s:]+([A-Za-z]+\s+[0-9]{1,2},?\s+[0-9]{4})\b',
+        r'DATE OF BIRTH:\s*([A-Za-z]+\s+[0-9]{1,2},?\s+[0-9]{4})',  # Specific to Beanie Baby format
+        r'\b([0-9]{1,2}[-/][0-9]{1,2}[-/][0-9]{2,4})\b',
+        r'\b([A-Za-z]+\s+[0-9]{1,2},?\s+[0-9]{4})\b'
+    ]
+    
+    # Try to find date of birth
+    for pattern in date_patterns:
+        match = re.search(pattern, all_text, re.IGNORECASE)
+        if match:
+            result["DateofBirth"] = match.group(1) if len(match.groups()) > 0 else match.group(0)
+            break
+    
+    # Enhanced name patterns specifically for Beanie Babies
+    name_patterns = [
+        r'\b([A-Za-z]+)™\b',  # Single word followed by ™ symbol
+        r'\b([A-Za-z]+)™(?=\s|$)',  # Word with ™ at end of string or before space
+        r'([A-Za-z]+)[™®]'  # Fallback: word followed by ™ or ® without word boundary
+    ]
+    
+    # Try to find name
+    for pattern in name_patterns:
+        match = re.search(pattern, all_text)
+        if match:
+            name = match.group(1).strip()
+            # Remove any trailing punctuation or symbols
+            name = re.sub(r'[^\w\s.-]$', '', name)
+            # Skip if the name is part of "The Beanie Babies Collection"
+            if name.lower() not in ['the', 'beanie', 'babies', 'collection']:
+                result["Name"] = name
+                break
+    
+    # Extract description - specifically looking for the poem/description on Beanie Baby tags
+    description_patterns = [
+        r"Isn't this just.*?\n(.*?)(?=www\.ty\.com|$)",  # Specific to this format
+        r"When we saw.*?\n(.*?)(?=www\.ty\.com|$)",      # Alternative starting point
+        r'(.+?)(?=www\.ty\.com|$)'                       # Fallback pattern
+    ]
+    
+    for pattern in description_patterns:
+        match = re.search(pattern, all_text, re.DOTALL | re.IGNORECASE)
+        if match:
+            description = match.group(1).strip()
+            # Clean up the description
+            description = re.sub(r'\s+', ' ', description)  # Normalize whitespace
+            if description:
+                result["Description"] = description
+                break
+
+    return result
+
 def process_document(models: dict, image: Image.Image, highres_image: Optional[Image.Image] = None,
                     filepath: Optional[str] = None, page_idx: Optional[int] = None,
                     languages: List[str] = None, use_pdf_boxes: bool = True,
@@ -229,113 +306,43 @@ def process_document(models: dict, image: Image.Image, highres_image: Optional[I
         logger.error(f"Error processing document: {str(e)}")
         raise SuryaProcessingError(f"Error processing document: {str(e)}")
 
-def main():
-    st.set_page_config(layout="wide")
-    col1, col2 = st.columns([.5, .5])
+def is_valid_image(file_path: str) -> bool:
+    """Check if the file is a valid image format"""
+    valid_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
+    return Path(file_path).suffix.lower() in valid_extensions
 
-    try:
-        # Load all models
-        models = load_models()
-    except SuryaProcessingError as e:
-        st.error(f"Error: {str(e)}")
-        st.stop()
+def process_uploaded_zip(zip_file) -> List[Tuple[str, Image.Image]]:
+    """Process uploaded ZIP file containing images"""
+    images = []
+    with tempfile.TemporaryDirectory() as temp_dir:
+        with zipfile.ZipFile(zip_file) as z:
+            z.extractall(temp_dir)
+            
+            # Walk through all files in the extracted directory
+            for root, _, files in os.walk(temp_dir):
+                for file in files:
+                    if is_valid_image(file):
+                        file_path = os.path.join(root, file)
+                        try:
+                            img = Image.open(file_path).convert("RGB")
+                            images.append((file, img))
+                        except Exception as e:
+                            logger.warning(f"Failed to process image {file}: {str(e)}")
+    
+    return sorted(images, key=lambda x: x[0].lower())
 
-    # File upload and language selection
-    in_file = st.sidebar.file_uploader("PDF file or image:", type=["pdf", "png", "jpg", "jpeg", "gif", "webp"])
-    languages = st.sidebar.multiselect(
-        "Languages", 
-        sorted(list(surya_modules["CODE_TO_LANGUAGE"].values())), 
-        default=[], 
-        max_selections=4,
-        help="Select document languages (optional) to improve OCR accuracy."
-    )
-
-    if in_file is None:
-        st.stop()
-
-    try:
-        # Process file based on type
-        filetype = in_file.type
-        if "pdf" in filetype:
-            doc = open_pdf(in_file)
-            page_count = len(doc)
-            page_number = st.sidebar.number_input(
-                f"Page number (1-{page_count}):",
-                min_value=1,
-                value=1,
-                max_value=page_count
-            )
-            pil_image = get_page_image(in_file, page_number, surya_modules["settings"].IMAGE_DPI)
-            pil_image_highres = get_page_image(in_file, page_number, surya_modules["settings"].IMAGE_DPI_HIGHRES)
-        else:
-            pil_image = Image.open(in_file).convert("RGB")
-            pil_image_highres = pil_image
-            page_number = None
-
-        # Processing options
-        use_pdf_boxes = st.sidebar.checkbox("Use PDF table boxes", value=True,
-                                          help="Use PDF file bounding boxes vs. text detection model for tables")
-        skip_table_detection = st.sidebar.checkbox("Skip table detection", value=False,
-                                                 help="Treat the whole image/page as a table")
-
-        # Process document when requested
-        if st.sidebar.button("Process Document"):
-            with st.spinner("Processing document..."):
-                results = process_document(
-                    models=models,
-                    image=pil_image,
-                    highres_image=pil_image_highres,
-                    filepath=in_file if "pdf" in filetype else None,
-                    page_idx=page_number - 1 if page_number else None,
-                    languages=languages,
-                    use_pdf_boxes=use_pdf_boxes,
-                    skip_table_detection=skip_table_detection
-                )
-
-                # Display results in tabs
-                with col1:
-                    tabs = st.tabs(["Text Detection", "Layout", "OCR", "Reading Order", "Table"])
-                    
-                    with tabs[0]:
-                        if "text_detection" in results:
-                            st.image(results["text_detection"]["image"], caption="Detected Text", use_column_width=True)
-                            st.json(results["text_detection"]["prediction"].model_dump(
-                                exclude=["heatmap", "affinity_map"]), expanded=False)
-                    
-                    with tabs[1]:
-                        if "layout" in results:
-                            st.image(results["layout"]["image"], caption="Detected Layout", use_column_width=True)
-                            st.json(results["layout"]["prediction"].model_dump(
-                                exclude=["segmentation_map"]), expanded=False)
-                    
-                    with tabs[2]:
-                        if "ocr" in results:
-                            st.image(results["ocr"]["image"], caption="OCR Result", use_column_width=True)
-                            json_tab, text_tab = st.tabs(["JSON", "Text Lines"])
-                            with json_tab:
-                                st.json(results["ocr"]["prediction"].model_dump(), expanded=False)
-                            with text_tab:
-                                st.text("\n".join([p.text for p in results["ocr"]["prediction"].text_lines]))
-                    
-                    with tabs[3]:
-                        if "order" in results:
-                            st.image(results["order"]["image"], caption="Reading Order", use_column_width=True)
-                            st.json(results["order"]["prediction"].model_dump(), expanded=False)
-                    
-                    with tabs[4]:
-                        if "table" in results:
-                            st.image(results["table"]["image"], caption="Table Recognition", use_column_width=True)
-                            st.json([p.model_dump() for p in results["table"]["prediction"]], expanded=False)
-
-        # Always show original image in second column
-        with col2:
-            st.image(pil_image, caption="Original Image", use_column_width=True)
-
-    except SuryaProcessingError as e:
-        st.error(f"Error processing document: {str(e)}")
-    except Exception as e:
-        st.error(f"Unexpected error: {str(e)}")
-        logger.exception("Unexpected error occurred")
+def process_uploaded_files(files) -> List[Tuple[str, Image.Image]]:
+    """Process uploaded files from a folder"""
+    images = []
+    for file in files:
+        if is_valid_image(file.name):
+            try:
+                img = Image.open(file).convert("RGB")
+                images.append((file.name, img))
+            except Exception as e:
+                logger.warning(f"Failed to process image {file.name}: {str(e)}")
+    
+    return sorted(images, key=lambda x: x[0].lower())
 
 def open_pdf(pdf_file):
     """Open a PDF file using pypdfium2"""
@@ -358,6 +365,240 @@ def get_page_image(pdf_file, page_num: int, dpi: int) -> Image.Image:
         return png.convert("RGB")
     except Exception as e:
         raise SuryaProcessingError(f"Error extracting page image: {str(e)}")
+        
+def main():
+    st.set_page_config(layout="wide")
+    col1, col2 = st.columns([.5, .5])
 
+    try:
+        # Load all models
+        models = load_models()
+    except SuryaProcessingError as e:
+        st.error(f"Error: {str(e)}")
+        st.stop()
+
+    # Upload type selection
+    upload_type = st.sidebar.radio(
+        "Upload type:",
+        ["Single File", "Image Folder", "ZIP File"],
+        help="Choose between uploading a single file, folder, or ZIP file containing multiple images"
+    )
+
+    # Initialize variables
+    current_images = []
+    current_highres_images = []
+    page_number = None
+    in_file = None
+
+    # Handle file uploads based on type
+    if upload_type == "Single File":
+        in_file = st.sidebar.file_uploader(
+            "PDF file or image:", 
+            type=["pdf", "png", "jpg", "jpeg", "gif", "webp"]
+        )
+        if in_file is None:
+            st.info("Please upload a file")
+            st.stop()
+            
+        try:
+            if "pdf" in in_file.type:
+                doc = open_pdf(in_file)
+                page_count = len(doc)
+                page_number = st.sidebar.number_input(
+                    f"Page number (1-{page_count}):",
+                    min_value=1,
+                    value=1,
+                    max_value=page_count
+                )
+                pil_image = get_page_image(in_file, page_number, surya_modules["settings"].IMAGE_DPI)
+                pil_image_highres = get_page_image(in_file, page_number, surya_modules["settings"].IMAGE_DPI_HIGHRES)
+                current_images = [(f"page_{page_number}", pil_image)]
+                current_highres_images = [(f"page_{page_number}", pil_image_highres)]
+            else:
+                pil_image = Image.open(in_file).convert("RGB")
+                current_images = [(in_file.name, pil_image)]
+                current_highres_images = [(in_file.name, pil_image)]
+        except Exception as e:
+            st.error(f"Error processing file: {str(e)}")
+            st.stop()
+
+    elif upload_type == "ZIP File":
+        in_file = st.sidebar.file_uploader(
+            "ZIP file containing images:",
+            type=["zip"]
+        )
+        if in_file is None:
+            st.info("Please upload a ZIP file")
+            st.stop()
+            
+        try:
+            current_images = process_uploaded_zip(in_file)
+            current_highres_images = current_images
+            if not current_images:
+                st.error("No valid images found in the ZIP file")
+                st.stop()
+        except Exception as e:
+            st.error(f"Error processing ZIP file: {str(e)}")
+            st.stop()
+
+    else:  # Image Folder
+        in_files = st.sidebar.file_uploader(
+            "Upload image files:",
+            type=["png", "jpg", "jpeg", "gif", "webp"],
+            accept_multiple_files=True
+        )
+        if not in_files:
+            st.info("Please upload image files")
+            st.stop()
+            
+        try:
+            current_images = process_uploaded_files(in_files)
+            current_highres_images = current_images
+            if not current_images:
+                st.error("No valid images uploaded")
+                st.stop()
+        except Exception as e:
+            st.error(f"Error processing uploaded files: {str(e)}")
+            st.stop()
+
+    # Language selection
+    languages = st.sidebar.multiselect(
+        "Languages", 
+        sorted(list(surya_modules["CODE_TO_LANGUAGE"].values())), 
+        default=[], 
+        max_selections=4,
+        help="Select document languages (optional) to improve OCR accuracy."
+    )
+
+    # Image selection for multiple files
+    if upload_type in ["ZIP File", "Image Folder"] and current_images:
+        # Add "Select All" option at the top of the selection list
+        image_options = ["All Images"] + [img[0] for img in current_images]
+        selected_image = st.sidebar.selectbox(
+            "Select image to process:",
+            options=image_options,
+            format_func=lambda x: x
+        )
+        
+        # Handle image selection
+        if selected_image == "All Images":
+            # Keep all images for processing
+            selected_images = current_images
+            selected_highres_images = current_highres_images
+        else:
+            # Get the selected single image
+            current_idx = [img[0] for img in current_images].index(selected_image)
+            selected_images = [current_images[current_idx]]
+            selected_highres_images = [current_highres_images[current_idx]]
+    else:
+        selected_images = current_images
+        selected_highres_images = current_highres_images
+
+    # Processing options
+    use_pdf_boxes = st.sidebar.checkbox(
+        "Use PDF table boxes",
+        value=True,
+        help="Use PDF file bounding boxes vs. text detection model for tables"
+    )
+    skip_table_detection = st.sidebar.checkbox(
+        "Skip table detection",
+        value=False,
+        help="Treat the whole image/page as a table"
+    )
+
+    # Display total number of images found
+    if upload_type in ["ZIP File", "Image Folder"]:
+        st.sidebar.info(f"Total images found: {len(current_images)}")
+        if selected_image == "All Images":
+            st.sidebar.warning(f"Processing all {len(current_images)} images")
+
+    # Display preview of first/selected image in second column
+    if selected_images:
+        with col2:
+            st.image(selected_images[0][1], caption="Preview Image", use_column_width=True)
+
+    # Process document when requested
+    if st.sidebar.button("Process Document"):
+        # Create a progress bar for multiple images
+        progress_bar = st.progress(0)
+        
+        with st.spinner("Processing document(s)..."):
+            try:
+                # Create a container for all results
+                all_results = {}
+                
+                # Process each image in the selection
+                for idx, ((img_name, pil_image), (_, pil_image_highres)) in enumerate(zip(selected_images, selected_highres_images)):
+                    st.subheader(f"Processing: {img_name}")
+                    
+                    results = process_document(
+                        models=models,
+                        image=pil_image,
+                        highres_image=pil_image_highres,
+                        filepath=in_file if upload_type == "Single File" and "pdf" in in_file.type else None,
+                        page_idx=page_number - 1 if page_number else None,
+                        languages=languages,
+                        use_pdf_boxes=use_pdf_boxes,
+                        skip_table_detection=skip_table_detection
+                    )
+                    
+                    # Extract just the text information
+                    extracted_text = extract_structured_text(results.get("ocr", {}).get("prediction"))
+                    all_results[img_name] = extracted_text
+                    
+                    # Update progress bar
+                    progress = (idx + 1) / len(selected_images)
+                    progress_bar.progress(progress)
+
+                    # Display results in tabs for current image
+                    with col1:
+                        tabs = st.tabs(["Extracted Text"])
+                        
+                        with tabs[0]:
+                            if extracted_text:
+                                st.json({
+                                    "DateofBirth": extracted_text["DateofBirth"],
+                                    "Name": extracted_text["Name"],
+                                    "Description": extracted_text["Description"]
+                                })
+
+                # After processing all images, show combined results
+                if len(selected_images) > 1:
+                    st.subheader("Combined Results")
+                    combined_json = {
+                        "processed_at": datetime.now().isoformat(),
+                        "total_images": len(selected_images),
+                        "images": {
+                            name: {
+                                "DateofBirth": results["DateofBirth"],
+                                "Name": results["Name"],
+                                "Description": results["Description"]
+                            }
+                            for name, results in all_results.items()
+                        }
+                    }
+                    st.json(combined_json)
+                else:
+                    # For single image
+                    st.subheader("Results")
+                    final_json = {
+                        "processed_at": datetime.now().isoformat(),
+                        "results": {
+                            "DateofBirth": all_results[list(all_results.keys())[0]]["DateofBirth"],
+                            "Name": all_results[list(all_results.keys())[0]]["Name"],
+                            "Description": all_results[list(all_results.keys())[0]]["Description"]
+                        }
+                    }
+                    st.json(final_json)
+
+            except SuryaProcessingError as e:
+                st.error(f"Error processing document: {str(e)}")
+            except Exception as e:
+                st.error(f"Unexpected error: {str(e)}")
+                logger.exception("Unexpected error occurred")
+            finally:
+                # Ensure progress bar reaches 100%
+                progress_bar.progress(1.0)
+                
 if __name__ == "__main__":
     main()
